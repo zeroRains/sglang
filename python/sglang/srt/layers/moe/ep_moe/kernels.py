@@ -771,6 +771,7 @@ def _fwd_kernel_ep_scatter_2(
     output_index_stride0,
     output_index_stride1,
     topk_num: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
     HIDDEN_SIZE: tl.constexpr,
     HIDDEN_SIZE_PAD: tl.constexpr,
     SCALE_HIDDEN_SIZE: tl.constexpr,
@@ -802,7 +803,7 @@ def _fwd_kernel_ep_scatter_2(
         for topk_idx_int32 in tl.range(0, topk_num, 1, num_stages=4):
             topk_index = topk_idx_int32.to(tl.int64)
             expert_id = tl.load(recv_topk + token_id * recv_topk_stride0 + topk_index)
-            if expert_id >= 0:
+            if expert_id >= 0 and expert_id < NUM_EXPERTS:
                 dest_token_index_int32 = tl.atomic_add(
                     expert_start_loc + expert_id, 1, sem=ATOMIC_ADD_SEM
                 )
@@ -902,6 +903,7 @@ def ep_scatter(
         output_index.stride(0),
         output_index.stride(1),
         topk_num=recv_topk.shape[1],
+        NUM_EXPERTS=num_experts,
         num_warps=num_warps,
         HIDDEN_SIZE=hidden_size,
         HIDDEN_SIZE_PAD=triton.next_power_of_2(hidden_size),
@@ -933,6 +935,7 @@ def _fwd_kernel_ep_gather(
     output_tensor_stride0,
     output_tensor_stride1,
     topk_num: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     cur_block_int32 = tl.program_id(0)
@@ -954,7 +957,7 @@ def _fwd_kernel_ep_gather(
             expert_id = tl.load(
                 recv_topk_ids + cur_token * recv_topk_ids_stride0 + topk_index
             )
-            if expert_id >= 0:
+            if expert_id >= 0 and expert_id < NUM_EXPERTS:
                 source_token_index_int32 = tl.load(
                     input_index + cur_token * input_index_stride0 + topk_index
                 )
@@ -987,6 +990,7 @@ def ep_gather(
     recv_topk_weight: torch.Tensor,
     input_index: torch.Tensor,
     output_tensor: torch.Tensor,
+    num_experts: int,
 ):
     num_warps = 2
     num_tokens = output_tensor.shape[0]
@@ -1012,6 +1016,7 @@ def ep_gather(
         output_tensor.stride(0),
         output_tensor.stride(1),
         topk_num=recv_topk_ids.shape[1],
+        NUM_EXPERTS=num_experts,
         num_warps=num_warps,
         BLOCK_D=BLOCK_D,
     )

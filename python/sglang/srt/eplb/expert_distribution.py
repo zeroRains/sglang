@@ -414,9 +414,15 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         self._misc_objects.append(
             dict(
                 layer_id=layer_idx,
-                num_tokens_per_rank=num_tokens_per_rank.cpu().tolist(),
-                num_tokens_per_rdma_rank=num_tokens_per_rdma_rank.cpu().tolist(),
-                num_tokens_per_expert=num_tokens_per_expert.cpu().tolist(),
+                num_tokens_per_rank=num_tokens_per_rank.cpu().tolist() if num_tokens_per_rank is not None else None,
+                num_tokens_per_rdma_rank=num_tokens_per_rdma_rank.cpu().tolist() if num_tokens_per_rdma_rank is not None else None,
+                num_tokens_per_expert=(
+                    num_tokens_per_expert
+                    if isinstance(num_tokens_per_expert, list)
+                    else num_tokens_per_expert.cpu().tolist()
+                )
+                if num_tokens_per_expert is not None
+                else None,
             )
         )
 

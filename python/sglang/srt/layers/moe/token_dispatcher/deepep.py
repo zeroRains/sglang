@@ -57,6 +57,23 @@ try:
 except ImportError:
     use_deepep = False
 
+# DeepEP V2 introduces `ElasticBuffer` alongside the legacy `Buffer`
+# (deepseek-ai/DeepEP#605, merged 2026-04-29). On V2 both classes are
+# exported from `deep_ep.__init__`, so the existing `from deep_ep import
+# Buffer` surface above continues to work unchanged — `ElasticBuffer` is
+# an additional, MoE-shape ctor with auto-QP sizing that callers may
+# opt into. The probe below is orthogonal to `use_deepep` and does not
+# affect the default code path. V2 usage is further gated on
+# `SGLANG_DEEPEP_USE_V2=1`. Mirrors the `HAVE_DEEP_EP_V2` probe shape
+# already used in NVIDIA/Megatron-LM's `fused_a2a.py`.
+try:
+    from deep_ep import ElasticBuffer
+
+    have_deepep_v2 = True
+except ImportError:
+    ElasticBuffer = None
+    have_deepep_v2 = False
+
 from enum import Enum, IntEnum, auto
 
 import torch
@@ -172,6 +189,22 @@ class DeepEPBuffer:
         cls._num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         cls._num_experts = num_experts
 
+        # Opt-in V2 path: construct `deep_ep.ElasticBuffer` instead of the
+        # legacy `deep_ep.Buffer`. V2 uses a MoE-shape ctor and infers the
+        # dispatch layout internally (no `get_dispatch_config` /
+        # `get_combine_config` / `get_nvl_buffer_size_hint` /
+        # `get_rdma_buffer_size_hint` calls). Gated behind an env var so
+        # the default code path is byte-identical to V1.
+        if have_deepep_v2 and get_bool_env_var("SGLANG_DEEPEP_USE_V2", default="false"):
+            cls._buffer = cls._build_v2_buffer(
+                group,
+                hidden_size,
+                deepep_mode,
+                num_max_dispatch_tokens_per_rank,
+                num_experts,
+            )
+            return cls._buffer
+
         num_nvl_bytes, num_rdma_bytes = 0, 0
         if deepep_mode.enable_normal():
             hidden_bytes = hidden_size * param_bytes
@@ -245,7 +278,69 @@ class DeepEPBuffer:
         return cls._buffer
 
     @classmethod
+    def _build_v2_buffer(
+        cls,
+        group: dist.ProcessGroup,
+        hidden_size: int,
+        deepep_mode: DeepEPMode,
+        num_max_dispatch_tokens_per_rank: int,
+        num_experts: int,
+    ):
+        """Construct a DeepEP V2 `ElasticBuffer` for opt-in V2 usage.
+
+        DeepEP V2 (deepseek-ai/DeepEP#605) collapses the V1 NVL/RDMA
+        byte-pool ctor into a single MoE-shape ctor and derives the
+        internal buffer size from `num_max_tokens_per_rank`, `hidden`,
+        and `num_topk`. `num_allocated_qps=0` asks V2 to auto-size and
+        auto-cap the Queue-Pair budget — on AWS EFA this clamps to the
+        safe 128-slot GIN ring ceiling (see the EFA fast-path in
+        `deep_ep/buffers/elastic.py`).
+
+        V2 does not expose `get_dispatch_config` / `get_combine_config`
+        / `num_qps_per_rank`, so the matching V1 code above is skipped.
+        """
+        # Use the same env var as V1 for buffer capacity. For V2, users
+        # should set SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK large
+        # enough to cover the normal-mode prefill batch (e.g., >=
+        # chunked_prefill_size). V2 does not have V1's 1024 ceiling.
+        if num_max_dispatch_tokens_per_rank <= 0:
+            num_max_dispatch_tokens_per_rank = (
+                envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+            )
+        # `num_topk` is not known at buffer-construction time in SGLang
+        # (the router choice is per-forward). DeepEP V2 accepts
+        # `num_topk=0` and falls back to a group-size-based conservative
+        # hint, so we pass 0 here and let V2 compute the ceiling.
+        num_topk = 0
+        # Low-latency mode still requires `num_experts % group.size() ==
+        # 0`. The normal mode works with `num_experts == -1`.
+        if deepep_mode.enable_low_latency():
+            assert num_experts != -1 and num_experts % group.size() == 0
+        
+        dist.barrier(group=group)
+
+        logger.info(
+            "SGLANG_DEEPEP_USE_V2=1: constructing deep_ep.ElasticBuffer "
+            "(num_max_tokens_per_rank=%d, hidden=%d, num_topk=%d).",
+            num_max_dispatch_tokens_per_rank,
+            hidden_size,
+            num_topk,
+        )
+        return ElasticBuffer(
+            group=group,
+            num_max_tokens_per_rank=num_max_dispatch_tokens_per_rank,
+            hidden=hidden_size,
+            num_topk=num_topk,
+            use_fp8_dispatch=False,
+        )
+
+    @classmethod
     def clean_buffer(cls):
+        # DeepEP V2's `ElasticBuffer` does not expose `low_latency_mode`
+        # or `clean_low_latency_buffer` — low-latency cleanup is handled
+        # internally via `EPHandle` lifetime. Fall through for V2.
+        if not hasattr(cls._buffer, "clean_low_latency_buffer"):
+            return
         if not cls._buffer.low_latency_mode:
             return
         cls._buffer.clean_low_latency_buffer(
@@ -335,9 +430,9 @@ class _DeepEPDispatcherImplBase:
         self.num_max_dispatch_tokens_per_rank = (
             envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         )
-        # DeepEP internode_ll dispatch uses FINISHED_SUM_TAG=1024
-        # and the logic requires num-tokens-sent-from-one-rank-to-another-rank less than it
-        assert self.num_max_dispatch_tokens_per_rank <= 1024
+        # DeepEP V1 internode_ll dispatch uses FINISHED_SUM_TAG=1024
+        # and the logic requires num-tokens-sent-from-one-rank-to-another-rank less than it.
+        self._assert_token_limit()
 
         self.handle = None
 
@@ -347,6 +442,9 @@ class _DeepEPDispatcherImplBase:
         self.meta_overlap_args: Optional[dict] = None
 
         self.set_deepep_dispatcher_dtype()
+
+    def _assert_token_limit(self):
+        assert self.num_max_dispatch_tokens_per_rank <= 1024
 
     def dispatch_a(
         self,
@@ -811,6 +909,216 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         )
 
 
+
+class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
+    """DeepEP V2 dispatcher impl using ElasticBuffer's unified dispatch/combine.
+
+    V2 unifies normal (prefill) and low-latency (decode) into a single API.
+    No mode branching needed -- the ElasticBuffer handles SM scheduling internally
+    via ``get_theoretical_num_sms()`` and overlap via ``async_with_compute_stream``.
+    """
+
+    def __init__(
+        self,
+        async_finish: bool,
+        return_recv_hook: bool,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        # V2 uses async_with_compute_stream for overlap; the V1 return_recv_hook
+        # mechanism (passing a hook callable back to the caller for deferred wait)
+        # is not supported.  async_with_compute_stream=True achieves the same
+        # effect: the current compute stream does NOT block on comm, and the
+        # caller invokes event.current_stream_wait() when results are needed.
+        # The orchestrator (DeepEPDispatcher) should force return_recv_hook=False,
+        # but we defensively ignore it here as well.
+        if return_recv_hook:
+            logger.warning_once(
+                "V2 does not support return_recv_hook; "
+                "ignoring (should have been forced False by caller)."
+            )
+        self.async_finish = async_finish
+        self.return_recv_hook = False
+        self.quant_config = {}
+
+    def _assert_token_limit(self):
+        pass  # V2 (ElasticBuffer) has no 1024 token-per-rank limit
+
+    # ------------------------------------------------------------------
+    # dispatch
+    # ------------------------------------------------------------------
+
+    def dispatch_a(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+    ):
+        topk_ids = topk_output.topk_ids.to(torch.int64)
+        topk_weights = topk_output.topk_weights
+        # V2 dispatch() accepts an (fp8_tensor, scale) tuple and returns
+        # an (fp8_tensor, scale) tuple via ``use_fp8_dispatch`` semantics.
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8:
+            hidden_states = sglang_per_token_group_quant_fp8(
+                hidden_states,
+                128,
+                column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            )
+
+        buffer = self._get_buffer()
+        _deepep_precompile_tp_barrier()
+
+        expert_alignment = 128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1
+        is_capturing = torch.cuda.is_current_stream_capturing()
+        # V2 unified dispatch API.
+        # x:                 input hidden states (BF16 tensor or (FP8 tensor, scale) tuple)
+        # topk_idx:         [num_tokens, num_topk] int64, -1 = no selection
+        # topk_weights:     [num_tokens, num_topk] float
+        # num_experts:       total expert count (for SM count estimation)
+        # expert_alignment:  per-local-expert token alignment (128 for deep_gemm)
+        # async_with_compute_stream: True → current stream does NOT wait on comm
+        # do_cpu_sync:       False during CUDA graph capture (avoids blocking CPU sync)
+        (
+            recv_x,
+            recv_topk_ids,
+            recv_topk_weights,
+            self.handle,
+            event,
+        ) = buffer.dispatch(
+            hidden_states,
+            topk_idx=topk_ids,
+            topk_weights=topk_weights,
+            num_experts=self.num_experts,
+            expert_alignment=expert_alignment,
+            async_with_compute_stream=self.async_finish,
+            do_cpu_sync=not is_capturing,
+        )
+
+        num_recv_tokens_per_expert = self.handle.num_recv_tokens_per_expert_list
+        if len(num_recv_tokens_per_expert) == 0:
+            # do_cpu_sync=False: reconstruct worst-case per-expert counts.
+            # expert_alignment tokens per local expert, derived from the allocated shape.
+            num_local_experts = self.handle.psum_num_recv_tokens_per_expert.shape[0]
+            num_recv_tokens_per_expert = [expert_alignment] * num_local_experts
+
+        # EPLB: V2 does not expose per-rank / per-rdma-rank token counts.
+        get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
+            num_recv_tokens_per_expert,
+            num_tokens_per_rank=None,
+            num_tokens_per_rdma_rank=None,
+            num_tokens_per_expert=num_recv_tokens_per_expert,
+        )
+
+        # 5-tuple stored by the orchestrator as _dispatch_intermediate_state.
+        return (
+            recv_x,
+            recv_topk_ids,
+            recv_topk_weights,
+            num_recv_tokens_per_expert,
+            event,
+        )
+
+    def dispatch_b(
+        self,
+        recv_x,
+        recv_topk_ids,
+        recv_topk_weights,
+        num_recv_tokens_per_expert,
+        event,
+    ):
+        assert isinstance(
+            recv_x, (torch.Tensor, tuple)
+        ), f"Expected Tensor or (Tensor, Tensor), got {type(recv_x)}"
+        assert isinstance(
+            num_recv_tokens_per_expert, list
+        ), f"Expected list, got {type(num_recv_tokens_per_expert)}"
+
+        if self.async_finish and event is not None:
+            event.current_stream_wait()
+
+        # Dispatch copy (comm_stream) writes only actual_recv rows; padding rows
+        # keep stale expert_ids that corrupt ep_scatter slot counters.
+        # psum_num_recv_tokens_per_expert[-1] is a GPU scalar written by the copy
+        # epilogue, valid after current_stream_wait. torch.where is CUDA-graph-
+        # compatible: actual_total is read from GPU memory on every replay.
+        actual_total = self.handle.psum_num_recv_tokens_per_expert[-1]  # GPU scalar
+        row_idx = torch.arange(
+            recv_topk_ids.shape[0], device=recv_topk_ids.device, dtype=actual_total.dtype
+        ).unsqueeze(1)
+        recv_topk_ids = torch.where(row_idx < actual_total, recv_topk_ids, -1)
+
+        # FP8 dispatch returns (tensor, scale) tuple; BF16 returns plain tensor.
+        if isinstance(recv_x, tuple):
+            hidden_states, hidden_states_scale = recv_x
+        else:
+            hidden_states, hidden_states_scale = recv_x, None
+
+        return DeepEPNormalDispatchOutput(
+            hidden_states,
+            hidden_states_scale,
+            recv_topk_ids,
+            recv_topk_weights,
+            num_recv_tokens_per_expert,
+        )
+
+    # ------------------------------------------------------------------
+    # combine
+    # ------------------------------------------------------------------
+
+    def combine_a(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ):
+        buffer = self._get_buffer()
+        _deepep_precompile_tp_barrier()
+
+        # V2 unified combine API.
+        # x:                 [num_tokens, hidden] BF16 tokens to reduce
+        # handle:             EPHandle from dispatch() with routing metadata
+        # async_with_compute_stream: True → current stream does NOT wait on comm
+        combined_x, _, event = buffer.combine(
+            hidden_states,
+            self.handle,
+            async_with_compute_stream=self.async_finish,
+        )
+
+        self.handle = None
+
+        return (combined_x, event)
+
+    def combine_b(self, output, event):
+        if self.async_finish and event is not None:
+            event.current_stream_wait()
+        return output
+
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+
+    def _get_buffer(self):
+        # V2's ElasticBuffer is mode-agnostic; no set_dispatch_mode needed.
+        return DeepEPBuffer.get_deepep_buffer(
+            self.group,
+            self.hidden_size,
+            self.params_bytes,
+            self.deepep_mode,
+            self.num_max_dispatch_tokens_per_rank,
+            self.num_experts,
+        )
+
+    def set_overlap_args(
+        self,
+        combine_overlap_args: CombineOverlapArgs,
+        meta_overlap_args: dict,
+    ):
+        # V2 overlap is built into async_with_compute_stream; the V1
+        # mechanism (dedicated comm stream + signal tensors) does not apply.
+        pass
+
+
 @dataclass
 class _Stage(Enum):
     INITIAL = auto()
@@ -848,16 +1156,36 @@ class DeepEPDispatcher(BaseDispatcher):
             deepep_mode=deepep_mode,
         )
 
-        if self.deepep_mode.enable_low_latency():
-            self._low_latency_dispatcher = _DeepEPDispatcherImplLowLatency(
+        # V2 opt-in: single unified dispatcher, no mode branching.
+        # ElasticBuffer internally handles normal vs low-latency SM scheduling.
+        _use_v2 = have_deepep_v2 and get_bool_env_var("SGLANG_DEEPEP_USE_V2", default="false")
+        if _use_v2:
+            # V2 replaces return_recv_hook with async_with_compute_stream.
+            # Force return_recv_hook=False; if the caller wanted overlap,
+            # async_finish=True achieves the same effect.
+            if return_recv_hook:
+                logger.warning_once(
+                    "V2 does not support return_recv_hook; "
+                    "forcing async_finish=True instead."
+                )
+                async_finish = True
+                return_recv_hook = False
+            self._v2_dispatcher = _DeepEPDispatcherImplV2(
+                async_finish=async_finish,
                 return_recv_hook=return_recv_hook,
                 **common_kwargs,
             )
-        if self.deepep_mode.enable_normal():
-            self._normal_dispatcher = _DeepEPDispatcherImplNormal(
-                async_finish=async_finish,
-                **common_kwargs,
-            )
+        else:
+            if self.deepep_mode.enable_low_latency():
+                self._low_latency_dispatcher = _DeepEPDispatcherImplLowLatency(
+                    return_recv_hook=return_recv_hook,
+                    **common_kwargs,
+                )
+            if self.deepep_mode.enable_normal():
+                self._normal_dispatcher = _DeepEPDispatcherImplNormal(
+                    async_finish=async_finish,
+                    **common_kwargs,
+                )
 
         self._stage = _Stage.INITIAL
         self._deepep_dispatch_hooks = DeepEPPDispatchHooks()
@@ -932,6 +1260,8 @@ class DeepEPDispatcher(BaseDispatcher):
         return self._get_impl().combine_b(*inner_state)
 
     def _get_impl(self) -> _DeepEPDispatcherImplBase:
+        if hasattr(self, "_v2_dispatcher"):
+            return self._v2_dispatcher
         is_extend_in_batch = get_is_extend_in_batch()
         resolved_deepep_mode = self.deepep_mode.resolve(is_extend_in_batch)
         if resolved_deepep_mode == DeepEPMode.NORMAL:
@@ -947,30 +1277,41 @@ class DeepEPDispatcher(BaseDispatcher):
 
     def set_quant_config(self, quant_config: dict):
         super().set_quant_config(quant_config)
-        if self.deepep_mode.enable_low_latency():
-            self._low_latency_dispatcher.set_quant_config(quant_config)
-        if self.deepep_mode.enable_normal():
-            self._normal_dispatcher.set_quant_config(quant_config)
+        if hasattr(self, "_v2_dispatcher"):
+            self._v2_dispatcher.set_quant_config(quant_config)
+        else:
+            if self.deepep_mode.enable_low_latency():
+                self._low_latency_dispatcher.set_quant_config(quant_config)
+            if self.deepep_mode.enable_normal():
+                self._normal_dispatcher.set_quant_config(quant_config)
 
     def set_overlap_args(
         self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict
     ):
         super().set_overlap_args(combine_overlap_args, meta_overlap_args)
-        if self.deepep_mode.enable_low_latency():
-            self._low_latency_dispatcher.set_overlap_args(
+        if hasattr(self, "_v2_dispatcher"):
+            self._v2_dispatcher.set_overlap_args(
                 combine_overlap_args, meta_overlap_args
             )
-        if self.deepep_mode.enable_normal():
-            self._normal_dispatcher.set_overlap_args(
-                combine_overlap_args, meta_overlap_args
-            )
+        else:
+            if self.deepep_mode.enable_low_latency():
+                self._low_latency_dispatcher.set_overlap_args(
+                    combine_overlap_args, meta_overlap_args
+                )
+            if self.deepep_mode.enable_normal():
+                self._normal_dispatcher.set_overlap_args(
+                    combine_overlap_args, meta_overlap_args
+                )
 
     def clear_overlap_args(self):
         super().clear_overlap_args()
-        if self.deepep_mode.enable_low_latency():
-            self._low_latency_dispatcher.clear_overlap_args()
-        if self.deepep_mode.enable_normal():
-            self._normal_dispatcher.clear_overlap_args()
+        if hasattr(self, "_v2_dispatcher"):
+            self._v2_dispatcher.clear_overlap_args()
+        else:
+            if self.deepep_mode.enable_low_latency():
+                self._low_latency_dispatcher.clear_overlap_args()
+            if self.deepep_mode.enable_normal():
+                self._normal_dispatcher.clear_overlap_args()
 
     def register_deepep_dispatch_hook(self, hook):
         return self._deepep_dispatch_hooks.register_hook(hook)

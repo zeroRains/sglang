@@ -716,6 +716,7 @@ def pre_permute_deepep_normal_to_deep_gemm(
 
     all_tokens = sum(num_recv_tokens_per_expert)
     running_state["all_tokens"] = all_tokens
+    running_state["num_experts"] = len(num_recv_tokens_per_expert)
 
     K = hidden_states.shape[1]
 
@@ -809,7 +810,7 @@ def post_permute_deep_gemm_to_deepep_normal(
         device=running_state["hidden_states_device"],
         dtype=torch.bfloat16,
     )
-    ep_gather(hidden_states, topk_ids, topk_weights, output_index, gather_out)
+    ep_gather(hidden_states, topk_ids, topk_weights, output_index, gather_out, running_state["num_experts"])
 
     return DeepEPNormalCombineInput(
         hidden_states=gather_out,
