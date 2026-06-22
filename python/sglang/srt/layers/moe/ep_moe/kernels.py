@@ -789,7 +789,8 @@ def _fwd_kernel_ep_scatter_2(
     index_in_s = tl.arange(0, SCALE_HIDDEN_SIZE_PAD)
     mask_s = index_in_s < SCALE_HIDDEN_SIZE
 
-    for token_id_int32 in range(start_token_id, total_token_num, grid_num):
+    total_token_num_val = tl.load(total_token_num)
+    for token_id_int32 in range(start_token_id, total_token_num_val, grid_num):
         token_id = token_id_int32.to(tl.int64)
         to_copy = tl.load(recv_x + token_id * recv_x_stride0 + offset_in, mask=mask)
         if IS_FP8:
@@ -843,6 +844,7 @@ def ep_scatter(
     m_indices: torch.Tensor,
     output_index: torch.Tensor,
     scale_ue8m0: bool = False,
+    num_tokens: torch.Tensor = None,
 ):
     BLOCK_E = 128  # token num of per expert is aligned to 128
     BLOCK_D = 128  # block size of quantization
@@ -882,7 +884,7 @@ def ep_scatter(
     grid = min(recv_topk.shape[0], 1024 * 8)
 
     _fwd_kernel_ep_scatter_2[(grid,)](
-        recv_topk.shape[0],
+        num_tokens,
         expert_start_loc,
         recv_x,
         recv_x.stride(0),
@@ -945,7 +947,8 @@ def _fwd_kernel_ep_gather(
 
     grid_num = tl.num_programs(1)
 
-    for cur_token_int32 in range(start_cur_token_int32, total_token_num, grid_num):
+    total_token_num_val = tl.load(total_token_num)
+    for cur_token_int32 in range(start_cur_token_int32, total_token_num_val, grid_num):
         cur_token = cur_token_int32.to(tl.int64)
 
         off_d = tl.arange(0, BLOCK_D)
@@ -991,13 +994,14 @@ def ep_gather(
     input_index: torch.Tensor,
     output_tensor: torch.Tensor,
     num_experts: int,
+    num_tokens: torch.Tensor = None,
 ):
     num_warps = 2
-    num_tokens = output_tensor.shape[0]
+    num_tokens_val = output_tensor.shape[0]
     hidden_size = input_tensor.shape[1]
     BLOCK_D = 128 if hidden_size % 1024 != 0 else 1024  # block size of quantization
     assert hidden_size % BLOCK_D == 0
-    grid = (triton.cdiv(hidden_size, BLOCK_D), min(num_tokens, 1024))
+    grid = (triton.cdiv(hidden_size, BLOCK_D), min(num_tokens_val, 1024))
     _fwd_kernel_ep_gather[grid](
         num_tokens,
         input_tensor,

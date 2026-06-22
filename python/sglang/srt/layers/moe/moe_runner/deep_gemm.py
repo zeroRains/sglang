@@ -711,6 +711,7 @@ def pre_permute_deepep_normal_to_deep_gemm(
         topk_ids,
         topk_weights,
         num_recv_tokens_per_expert,
+        num_tokens,
     ) = dispatch_output
     assert runner_config.activation == "silu"
 
@@ -775,12 +776,14 @@ def pre_permute_deepep_normal_to_deep_gemm(
         m_indices,
         output_index,
         scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        num_tokens=num_tokens,
     )
     dispose_tensor(hidden_states)
     if hidden_states_scale is not None:
         dispose_tensor(hidden_states_scale)
 
     running_state["output_index"] = output_index
+    running_state["num_tokens"] = num_tokens
 
     return DeepGemmRunnerInput(
         hidden_states=input_tensor,
@@ -810,7 +813,7 @@ def post_permute_deep_gemm_to_deepep_normal(
         device=running_state["hidden_states_device"],
         dtype=torch.bfloat16,
     )
-    ep_gather(hidden_states, topk_ids, topk_weights, output_index, gather_out, running_state["num_experts"])
+    ep_gather(hidden_states, topk_ids, topk_weights, output_index, gather_out, running_state["num_experts"], running_state.get("num_tokens"))
 
     return DeepEPNormalCombineInput(
         hidden_states=gather_out,

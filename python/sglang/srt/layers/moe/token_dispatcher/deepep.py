@@ -107,6 +107,7 @@ class DeepEPNormalDispatchOutput(NamedTuple):
     topk_ids: torch.Tensor
     topk_weights: torch.Tensor
     num_recv_tokens_per_expert: List[int]
+    num_tokens: torch.Tensor
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -940,6 +941,7 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
         self.async_finish = async_finish
         self.return_recv_hook = False
         self.quant_config = {}
+        self.num_tokens = torch.tensor([1], dtype=torch.int32, device="cuda")
 
     def _assert_token_limit(self):
         pass  # V2 (ElasticBuffer) has no 1024 token-per-rank limit
@@ -995,6 +997,9 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
             do_cpu_sync=not is_capturing,
         )
 
+        if self.async_finish and event is not None:
+            event.current_stream_wait()
+
         num_recv_tokens_per_expert = self.handle.num_recv_tokens_per_expert_list
         if len(num_recv_tokens_per_expert) == 0:
             # do_cpu_sync=False: reconstruct worst-case per-expert counts.
@@ -1034,19 +1039,17 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
             num_recv_tokens_per_expert, list
         ), f"Expected list, got {type(num_recv_tokens_per_expert)}"
 
-        if self.async_finish and event is not None:
-            event.current_stream_wait()
-
         # Dispatch copy (comm_stream) writes only actual_recv rows; padding rows
         # keep stale expert_ids that corrupt ep_scatter slot counters.
         # psum_num_recv_tokens_per_expert[-1] is a GPU scalar written by the copy
         # epilogue, valid after current_stream_wait. torch.where is CUDA-graph-
         # compatible: actual_total is read from GPU memory on every replay.
-        actual_total = self.handle.psum_num_recv_tokens_per_expert[-1]  # GPU scalar
-        row_idx = torch.arange(
-            recv_topk_ids.shape[0], device=recv_topk_ids.device, dtype=actual_total.dtype
-        ).unsqueeze(1)
-        recv_topk_ids = torch.where(row_idx < actual_total, recv_topk_ids, -1)
+        # actual_total = self.handle.psum_num_recv_tokens_per_scaleup_rank[-1]  # GPU scalar
+        # row_idx = torch.arange(
+        #     recv_topk_ids.shape[0], device=recv_topk_ids.device, dtype=actual_total.dtype
+        # ).unsqueeze(1)
+        # recv_topk_ids = torch.where(row_idx < actual_total, recv_topk_ids, -1)
+        self.num_tokens.copy_(self.handle.psum_num_recv_tokens_per_scaleup_rank[-1:], non_blocking=True)
 
         # FP8 dispatch returns (tensor, scale) tuple; BF16 returns plain tensor.
         if isinstance(recv_x, tuple):
@@ -1060,6 +1063,7 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
             recv_topk_ids,
             recv_topk_weights,
             num_recv_tokens_per_expert,
+            self.num_tokens,
         )
 
     # ------------------------------------------------------------------
